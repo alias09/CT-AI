@@ -1,0 +1,44 @@
+services:
+  redis:
+    image: redis:7-alpine
+  db:
+    image: 'postgres:14-alpine'
+    volumes:
+      - ./tmp/db:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=password
+  web:
+    build: .
+    command: bash -c "mkdir -p tmp/pids && rm -f tmp/pids/server.pid && bundle exec rails s -p 3000 -b '0.0.0.0'"
+    volumes:
+      - .:/webapp
+      - /webapp/lib/python/venv # Изолируем venv от локального монтирования
+      - ../test_archives:/webapp/test_archives
+      - shared-tmp:/webapp/tmp
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgres://postgres:password@db
+      - RAILS_ENV=development
+
+  sidekiq:
+    build: .
+    volumes:
+      - .:/webapp
+      - /webapp/lib/python/venv # Изолируем venv от локального монтирования
+      - ../test_archives:/webapp/test_archives
+      - shared-tmp:/webapp/tmp
+    command: bundle exec sidekiq -q default
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgres://postgres:password@db
+      - RAILS_ENV=development
+
+volumes:
+  shared-tmp:
+

@@ -1,0 +1,760 @@
+# Spectra - CNN - 1.5.0 - metrics
+
+```elixir
+Mix.install(
+  [
+    {:axon, "~> 0.7"},
+    {:nx, "~> 0.10"},
+    {:exla, "~> 0.10"},
+    {:kino, "~> 0.14.2"},
+    {:scholar, "~> 0.3.0"},
+    {:vega_lite, "~> 0.1"},
+    {:kino_vega_lite, "~> 0.1"},
+    {:explorer, "~> 0.5"},
+    {:cartesian, "~> 0.1"},
+    {:stb_image, "~> 0.7"}
+  ],
+  config: [
+    nx: [
+      default_backend: EXLA.Backend,
+      default_defn_options: [compiler: EXLA, lazy_transfers: :always]
+    ],
+    exla: [
+      default_client: :cuda,
+      clients: [
+        host: [platform: :host],
+        cuda: [platform: :cuda12]
+      ]
+    ]
+  ],
+  system_env: [
+    XLA_TARGET: "cuda12"
+  ]
+)
+
+
+Nx.default_backend(EXLA.Backend)
+
+Application.put_env(:exla, :clients,
+  cuda: [platform: :cuda]
+)
+
+
+```
+
+## Парсинг файлов
+
+```elixir
+defmodule Thermosol.ImageFileParser do
+  import Nx.Defn
+
+  @output_size {128, 128}
+
+  def fetch_data_from_files(path) do
+    files = Path.wildcard(path)
+
+    {
+      files
+      |> Task.async_stream(&read_file/1, timeout: 30000)
+      |> Enum.map(fn {:ok, data} -> data end),
+      fetch_labels(files)
+    }
+  end
+
+  # Data
+
+  defp read_file(path) do
+    path
+    |> StbImage.read_file!()
+    |> StbImage.to_nx()
+    |> image_to_grayscale()
+    |> resize_image()
+  end
+
+  defnp image_to_grayscale(img_tensor) do
+    if Nx.rank(img_tensor) == 3 do
+      # Simple average for RGB to grayscale
+      Nx.mean(img_tensor, axes: [2])
+    else
+      img_tensor
+    end
+  end
+
+  defnp resize_image(img_tensor) do
+    Nx.image.resize(img_tensor, size: @output_size)
+  end
+
+  # Labels
+
+  defp fetch_labels(files) do
+    files
+    |> Stream.map(&extract_mineral_name/1)
+  end
+
+  defp extract_mineral_name(path) do
+    case String.split(path, "/") do
+      splitted_path -> Enum.at(splitted_path, -2)
+    end
+  end
+end
+
+```
+
+```elixir
+defmodule Plots do
+  alias VegaLite, as: Vl
+
+  def dataset_to_map(spectra, one_hot_dictionary) do
+    spectra
+    |> Enum.with_index(fn {spectrum, enc}, i -> {String.to_atom("#{one_hot_dictionary[enc]}_#{i}"), spectrum} end)
+    |> Enum.into(%{})
+  end
+  
+  def display_spectra(spectra, 
+    x_interval, 
+    opts \\ [title: "Spectra", width: 800, height: 180]) 
+    when is_map(spectra) and is_map(x_interval) 
+  do
+    [x_key] = Map.keys(x_interval)
+
+    df = Explorer.DataFrame.new(Map.merge(x_interval, spectra))
+
+    Vl.new(title: opts[:title], width: opts[:width], height: opts[:height])
+    |> Vl.data_from_values(Explorer.DataFrame.to_columns(df))
+    |> Vl.encode_field(:color, "Legend")
+    |> Vl.layers(
+      Enum.map(spectra, fn {key, _} -> 
+        Vl.new()
+        |> Vl.transform(calculate: "'#{Atom.to_string(key)}'", as: "Legend")
+        |> Vl.mark(:line)
+        |> Vl.encode_field(:x, Atom.to_string(x_key), type: :quantitative)
+        |> Vl.encode_field(:y, Atom.to_string(key), type: :quantitative, axis: %{title: nil}) 
+      end)
+    )
+    |> Vl.config(legend: %{orient: "bottom", direction: "horizontal"})
+  end
+end
+```
+
+```elixir
+defmodule Thermosol.Augmentation do
+  import Nx.Defn
+
+  def augment(image_tensor) do
+    image_tensor
+    |> random_flip()
+    |> random_rotate()
+  end
+
+  defnp random_flip(image_tensor, probability \ 0.5) do
+    if :rand.uniform() < probability do
+      # Flip left-right
+      Nx.reverse(image_tensor, axes: [1])
+    else
+      image_tensor
+    end
+  end
+
+  defnp random_rotate(image_tensor, probability \ 0.5) do
+    if :rand.uniform() < probability do
+      k = :rand.uniform(3) + 1 # Rotate 90, 180, or 270 degrees
+      Nx.rot90(image_tensor, k, axes: {0, 1})
+    else
+      image_tensor
+    end
+  end
+end
+
+```
+
+## Подготовка данных
+
+```elixir
+defmodule Thermosol.DataPreparing do
+  import Nx
+  import Nx.Defn
+  import Thermosol.Augmentation
+
+  alias Scholar.Preprocessing.MinMaxScaler, as: MinMaxScaler
+
+  def prepare_data(data, encoded_labels) do
+    data
+    |> Enum.map(&prepare_image/1)
+    |> Enum.zip(encoded_labels)
+    |> Enum.shuffle()
+  end
+
+  def split_to_datasets(data,
+    test_proportion \ 0.25, 
+    val_proportion \ 0.25) do
+      data
+      |> Enum.group_by(fn {_, label} -> label end)
+      |> Enum.reduce({[], [], []}, fn {_, list}, {train_acc, test_acc, val_acc} ->
+        {train_dataset, test_dataset, val_dataset} = split_class_to_datasets(list, test_proportion, val_proportion)
+          {
+            Enum.concat(train_acc, train_dataset),
+            Enum.concat(test_acc, test_dataset),
+            Enum.concat(val_acc, val_dataset)
+          }
+        end)
+  end
+  
+  def balance_dataset(dataset, dataset_class_size) do
+    dataset
+     |> Enum.group_by(fn {_, label} -> label end)
+     |> balance_classes(dataset_class_size)
+     |> Enum.reduce([], fn {_, list}, acc ->
+       Enum.concat(acc, list)
+       end)
+  end
+
+  defp split_class_to_datasets(dataset, test_proportion, val_proportion) do
+    dataset_size = length(dataset)
+  
+    {test_dataset, dataset} = Enum.split(dataset, Kernel.round(dataset_size * test_proportion))
+    {val_dataset, train_dataset} = Enum.split(dataset, Kernel.round(dataset_size * val_proportion))
+  
+    {train_dataset, test_dataset, val_dataset}
+  end
+  
+  # Preparing image data
+
+  defnp prepare_image(image_tensor) do
+    image_tensor
+    |> Nx.as_type(:f32)
+    |> Nx.divide(255.0) # Normalize to [0, 1]
+    |> Nx.new_axis(-1)   # Add channel axis
+  end
+
+  # Processing spectrum labels
+
+  def encode_labels(labels) do
+    labels = Enum.map(labels, fn x -> String.split(x, "-") end)
+    unique_labels = Enum.uniq(labels) 
+    unique_minerals_labels = unique_labels |> List.flatten() |> Enum.uniq()
+    one_hot_tensor_size = length(unique_minerals_labels)
+
+    mineral_codes =
+      unique_minerals_labels
+      |> Enum.with_index(fn name, index ->
+        {name, Nx.backend_copy(Nx.equal(index, Nx.iota({one_hot_tensor_size})))}
+      end)
+      |> Enum.into(%{})
+
+    reversed_one_hot_dictionary =
+      unique_labels
+      |> Enum.map(
+        fn label -> 
+            {label, Enum.reduce(
+            label, 
+            Nx.broadcast(0, {one_hot_tensor_size}), 
+            fn x, acc -> 
+              Nx.add(acc, mineral_codes[x])
+            end
+          )
+          |> Nx.backend_copy() }
+        end)
+      |> Enum.into(%{})
+    
+    encoded_labels =
+      labels
+      |> Enum.map(fn label -> reversed_one_hot_dictionary[label] end)
+    
+    one_hot_dictionary = Enum.reduce(reversed_one_hot_dictionary, %{}, fn {name, code}, acc -> Map.put(acc, code, name) end )
+
+    {encoded_labels, one_hot_dictionary}
+  end
+
+  def unique_labels(labels) do
+     Enum.map(labels, fn x -> String.split(x, "-") end)
+     |> Enum.uniq() 
+     |> List.flatten() 
+     |> Enum.uniq()
+  end
+end
+
+```
+
+## Метрики
+
+## Пайплайны
+
+```elixir
+defmodule Thermosol.Pipelines do
+  import Thermosol.Augmentation
+
+  def train_test_val_pipelines(
+    train_dataset, 
+    test_dataset, 
+    val_dataset, 
+    train_batch_size \\ 100, 
+    val_test_batch_size \\ 10
+  ) 
+    when is_list(train_dataset) and is_list(test_dataset) and is_list(val_dataset) and is_integer(train_batch_size) and is_integer(val_test_batch_size) do      
+      {
+        pipeline_with_augmentations(train_dataset, train_batch_size),
+        pipeline(test_dataset, val_test_batch_size),
+        pipeline(val_dataset, val_test_batch_size)
+      }
+  end
+  
+  defp pipeline(dataset, batch_size) do
+    dataset
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn chunks ->
+      {spectrum_chunk, label_chunk} = Enum.unzip(chunks)
+      {Nx.stack(spectrum_chunk), Nx.stack(label_chunk)}
+    end)
+  end
+  
+    defp pipeline_with_augmentations(dataset, batch_size) do
+    dataset
+    |> Stream.map(fn {image, label} -> {Thermosol.Augmentation.augment(image), label} end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn chunks ->
+      {image_chunk, label_chunk} = Enum.unzip(chunks)
+      {Nx.stack(image_chunk), Nx.stack(label_chunk)}
+    end)
+  end
+end
+```
+
+```elixir
+
+# Укажите путь к вашим изображениям
+train_path = "/path/to/your/images/*/*.png"
+
+{data, labels} = Thermosol.ImageFileParser.fetch_data_from_files(train_path)
+
+{encoded_labels, one_hot_dictionary} = Thermosol.DataPreparing.encode_labels(labels)
+
+{train_dataset, test_dataset, val_dataset} = 
+  data
+  |> Thermosol.DataPreparing.prepare_data(encoded_labels)
+  |> Thermosol.DataPreparing.split_to_datasets(0.25, 0.25)
+
+
+{train_pipeline, test_pipeline, val_pipeline} = 
+  Thermosol.Pipelines.train_test_val_pipelines(
+    Enum.shuffle(train_dataset),
+    Enum.shuffle(test_dataset), 
+    Enum.shuffle(val_dataset),
+    500
+  )
+
+
+length(train_dataset)
+```
+
+```elixir
+# Этот блок кода для визуализации 1D-спектров больше несовместим с 2D-данными.
+# Вы можете раскомментировать и адаптировать его для отображения изображений, если необходимо.
+# {image, label} = train_dataset |> Enum.at(0)
+# Kino.image(image, format: :grayscale)
+```
+
+```elixir
+defmodule Thermosol.Losses do
+  import Nx.Defn
+
+  defn weighted_bce(y_true, y_pred, opts \\ []) do
+    opts =
+    keyword!(opts,
+      positive_weights: Nx.broadcast(1.0, Nx.axis_size(y_true, 1)),
+      negative_weights: Nx.broadcast(1.0, Nx.axis_size(y_true, 1)),
+      reduction: :mean,
+      from_logits: false
+    )
+
+    eps = 1.0e-7
+    
+    y_pred_probs = 
+      if opts[:from_logits] do
+        Nx.sigmoid(y_pred)
+      else
+        y_pred
+      end
+
+    term1 = y_true * Nx.log(y_pred_probs + eps) * opts[:positive_weights]
+    term2 = (1 - y_true) * Nx.log(1 - y_pred_probs + eps) * opts[:negative_weights]
+    
+    bce = - (term1 + term2)
+
+    case opts[:reduction] do
+      :none -> bce
+      :sum -> Nx.sum(bce)
+      :mean -> Nx.mean(bce)
+    end
+  end
+
+  def calculate_pos_neg_weights(train_dataset) do
+    {_, labels} = Enum.unzip(train_dataset)
+
+    labels
+    |> Nx.stack()
+    |> do_calculate_pos_neg_weights()
+  end
+
+  def do_calculate_pos_neg_weights(labels) do
+    
+    total_samples = Nx.axis_size(labels, 0)
+
+    positives_per_class = Nx.sum(labels, axes: [0])
+    negatives_per_class = Nx.negate(Nx.subtract(positives_per_class, Nx.axis_size(labels, 0)))
+
+    {
+      Nx.divide(total_samples, Nx.multiply(positives_per_class, 2)),
+      Nx.divide(total_samples, Nx.multiply(negatives_per_class, 2))
+    }
+  end
+end
+
+
+{pos_weights, neg_weights} = Thermosol.Losses.calculate_pos_neg_weights(train_dataset)
+```
+
+```elixir
+IO.inspect(length(train_dataset), label: "Тренировочная выборка")
+IO.inspect(length(synth_dataset), label: "Искусственная выборка")
+
+IO.inspect(Nx.to_list(pos_weights), label: "Позитивный вектор весов")
+IO.inspect(Nx.to_list(neg_weights), label: "Отрицательный вектор весов")
+
+
+
+```
+
+```elixir
+defmodule Thermosol.Metrics do
+  import Nx.Defn
+
+  # Subset Accuracy - доля полностью правильных предсказаний
+  defn subset_accuracy_from_logits(y_true, y_pred) do
+    subset_accuracy(y_true, Nx.sigmoid(y_pred))
+  end
+  
+  defn subset_accuracy(y_true, y_pred) do
+    y_pred
+    |> binarize()
+    |> Nx.equal(y_true)
+    |> Nx.all(axes: [1])
+    |> Nx.mean()    
+  end
+
+  # Accuracy - точность
+  defn accuracy_from_logits(y_true, y_pred) do
+    accuracy(y_true, Nx.sigmoid(y_pred))
+  end
+  
+  defn accuracy(y_true, y_pred) do
+    y_pred_binary = binarize(y_pred)
+
+    intersection_cardinality = Nx.sum(Nx.logical_and(y_true, y_pred_binary), axes: [1])
+    union_cardinality = Nx.sum(Nx.logical_or(y_pred_binary, y_true), axes: [1])
+
+    intersection_cardinality
+    |> Nx.divide(union_cardinality)
+    |> Nx.mean()
+  end
+
+  # Hamming loss - доля неправильных предсказаний меток
+  defn hamming_loss_from_logits(y_true, y_pred) do
+    hamming_loss(y_true, Nx.sigmoid(y_pred))
+  end
+  
+  defn hamming_loss(y_true, y_pred) do
+    y_pred
+    |> binarize()
+    |> Nx.not_equal(y_true)
+    |> Nx.mean()
+  end
+
+  # Recall - доля предсказанных истинных меток относительно общего числа истинных меток
+  defn recall_from_logits(y_true, y_pred) do
+    recall(y_true, Nx.sigmoid(y_pred))
+  end
+  
+  defn recall(y_true, y_pred) do
+    y_pred_binary = binarize(y_pred)
+
+    true_positive_cardinality = Nx.sum(Nx.logical_and(y_true, y_pred_binary), axes: [1])
+    true_cardinality = Nx.sum(y_true, axes: [1])
+
+    true_positive_cardinality
+    |> Nx.divide(true_cardinality)
+    |> Nx.mean()
+  end
+
+  # Precision - Точность предсказаний
+  defn precision_from_logits(y_true, y_pred) do
+    precision(y_true, Nx.sigmoid(y_pred))
+  end
+  
+  defn precision(y_true, y_pred) do
+    y_pred_binary = binarize(y_pred)
+
+    # Во избежание 0/0. 
+    # Получаем в данном случае precision=0, если сеть ничего не предсказала для случая.
+    epsilon = 1.0e-7
+
+    true_positive_cardinality = Nx.sum(Nx.logical_and(y_true, y_pred_binary), axes: [1])
+    predicted_cardinality = Nx.sum(y_pred_binary, axes: [1]) + epsilon
+
+    true_positive_cardinality
+    |> Nx.divide(predicted_cardinality)
+    |> Nx.mean()
+  end
+
+  # f1 - Гармоническое среднее precision и recall
+  defn f1_from_logits(y_true, y_pred) do
+    f1(y_true, Nx.sigmoid(y_pred))
+  end
+  
+  defn f1(y_true, y_pred) do
+    y_pred_binary = binarize(y_pred)
+
+    true_positive_cardinality = Nx.sum(Nx.logical_and(y_true, y_pred_binary), axes: [1])
+    predicted_cardinality = Nx.sum(y_pred_binary, axes: [1])
+    true_cardinality = Nx.sum(y_true, axes: [1])
+
+    2 * true_positive_cardinality
+    |> Nx.divide(true_cardinality + predicted_cardinality)
+    |> Nx.mean()
+  end
+
+  defnp binarize(y_pred, threshold \\ 0.5) do
+    Nx.select(y_pred >= threshold, 1.0, 0.0)
+  end
+end
+
+y_true = Nx.tensor([[0,1,0],
+                   [0,1,1],
+                   [1,0,1],
+                   [0,0,1]])
+y_pred = Nx.tensor([[0,0,0],
+                   [0,1,1],
+                   [0,0,0],
+                   [1,0,0]])
+
+Thermosol.Metrics.hamming_loss(y_true, y_pred)
+
+
+
+## Модель
+
+```elixir
+defmodule Thermosol.Model do
+  def create_model(params, output_size) do
+    input = Axon.input("input", shape: {nil, 128, 128, 1})
+
+    input
+    |> Axon.conv_2d(params.filters, kernel_size: params.kernel_size, activation: :relu, padding: :same)
+    |> Axon.avg_pool_2d(kernel_size: {2, 2}, strides: {2, 2})
+    |> Axon.conv_2d(params.filters * 2, kernel_size: params.kernel_size, activation: :relu, padding: :same)
+    |> Axon.avg_pool_2d(kernel_size: {2, 2}, strides: {2, 2})
+    |> Axon.flatten()
+    |> Axon.dense(params.dense_layers_size, activation: :relu)
+  require Logger
+
+  def run(train_pipeline, val_pipeline, test_pipeline, pos_weights, neg_weights, epochs, num_trials) do
+    param_grid = %{
+      filters: [16, 32, 64],
+      kernel_size: [{3, 3}, {5, 5}],
+      dense_layers_size: [64, 128, 256],
+      dropout_rate: [0.3, 0.5]
+    }
+
+    loss = fn y_true, y_pred ->
+      Thermosol.Losses.weighted_bce(y_true, y_pred, 
+        positive_weights: pos_weights, 
+        negative_weights: neg_weights,
+        from_logits: false
+      )
+    end
+
+    combinations = Cartesian.product(param_grid |> Map.values())
+
+    all_results = 
+      combinations
+      |> Enum.map(fn combination ->
+        params = Enum.zip(Map.keys(param_grid), combination) |> Map.new()
+        Logger.info("Testing configuration: #{inspect(params)}")
+
+        trials_results = for _ <- 1..num_trials do
+          {_model_state, metrics} = train_and_test(train_pipeline, val_pipeline, test_pipeline, params, loss, epochs)
+          metrics
+        end
+
+        avg_accuracy = Enum.map(trials_results, & &1["accuracy"]) |> Enum.sum() / num_trials
+        avg_recall = Enum.map(trials_results, & &1["recall"]) |> Enum.sum() / num_trials
+        f1_score = if (avg_accuracy + avg_recall) > 0, do: 2 * (avg_accuracy * avg_recall) / (avg_accuracy + avg_recall), else: 0
+
+        %{params: params, avg_accuracy: avg_accuracy, avg_recall: avg_recall, f1_score: f1_score, all_trials: trials_results}
+      end)
+
+    best_config = find_best_configuration(all_results)
+    save_best_configuration("best_config.txt", best_config)
+    best_config
+  end
+
+  defp train_and_test(train_pipeline, val_pipeline, test_pipeline, params, loss, epochs) do
+    output_size = train_pipeline |> Stream.take(1) |> Enum.to_list() |> hd() |> elem(1) |> Nx.shape() |> elem(1)
+    model = Thermosol.Model.create_model(params, output_size)
+    model_state = fit_model(model, train_pipeline, val_pipeline, epochs, loss)
+    metrics = test_model(model, model_state, test_pipeline)
+    {model_state, metrics}
+  end
+
+  defp fit_model(model, train_pipeline, val_pipeline, epochs, loss) do
+    model
+    |> Axon.Loop.trainer(loss, :adam)
+    |> Axon.Loop.metric(:accuracy)
+    |> Axon.Loop.metric(&Thermosol.Metrics.recall/2, "recall")
+    |> Axon.Loop.validate(model, val_pipeline)
+    |> Axon.Loop.early_stop("validation_loss", 
+        mode: :min, 
+        patience: 15)
+    |> Axon.Loop.run(train_pipeline, %{}, epochs: epochs)
+  end
+
+  defp test_model(model, model_state, test_pipeline) do
+    model
+    |> Axon.Loop.evaluator()
+    |> Axon.Loop.metric(:accuracy)
+    |> Axon.Loop.metric(:recall)
+    |> Axon.Loop.run(test_pipeline, model_state, compiler: EXLA)
+    |> extract_metrics_from_batch()
+  end
+
+  defp extract_metrics_from_batch(metrics) do
+    case metrics do
+      %{0 => batch_metrics} when is_map(batch_metrics) ->
+        %{
+          "accuracy" => extract_tensor_value(batch_metrics["accuracy"]),
+          "recall" => extract_tensor_value(batch_metrics["recall"])
+        }
+      
+      %{} ->
+        %{
+          "accuracy" => extract_tensor_value(metrics["accuracy"]),
+          "recall" => extract_tensor_value(metrics["recall"])
+        }
+      
+      _ ->
+        %{"accuracy" => 0.0, "recall" => 0.0}
+    end
+  end
+
+  defp extract_tensor_value(nil), do: 0.0
+  defp extract_tensor_value(tensor) when is_struct(tensor, Nx.Tensor) do
+    tensor
+    |> Nx.to_number()
+    |> Float.round(6)
+  end
+  defp extract_tensor_value(value) when is_number(value), do: value
+  defp extract_tensor_value(_), do: 0.0
+
+  defp find_best_configuration(all_results) do
+    all_results
+    |> Enum.max_by(fn %{f1_score: f1_score} -> f1_score end)
+  end
+
+defp save_best_configuration(file_path, best_config) do
+    %{
+      params: params,
+      avg_accuracy: avg_accuracy,
+      avg_recall: avg_recall,
+      f1_score: f1_score,
+      all_trials: trials
+    } = best_config
+
+    trials_entries = 
+      trials
+      |> Enum.with_index(1)
+      |> Enum.map_join("\n", fn {metrics, idx} ->
+        "Попытка #{idx}: accuracy=#{metrics["accuracy"]}, recall=#{metrics["recall"]}"
+      end)
+
+    content = """
+    ЛУЧШАЯ КОНФИГУРАЦИЯ
+    ===================
+    Параметры: #{inspect(params)}
+    Средняя accuracy: #{Float.round(avg_accuracy, 6)}
+    Средняя recall: #{Float.round(avg_recall, 6)}
+    F1-score: #{Float.round(f1_score, 6)}
+    
+    Детали по попыткам:
+    #{trials_entries}
+    
+    Время поиска: #{generate_timestamp()}
+    """
+
+    File.write!(file_path, content)
+    Logger.info("Лучшая конфигурация сохранена в: #{file_path}")
+  end
+
+  defp generate_timestamp do
+    {{year, month, day}, {hour, minute, second}} = :calendar.universal_time()
+    "#{year}-#{pad(month)}-#{pad(day)}_#{pad(hour)}:#{pad(minute)}:#{pad(second)}"
+  end
+
+  defp pad(number) do
+    number
+    |> Integer.to_string()
+    |> String.pad_leading(2, "0")
+  end
+
+  defp log_trial_result(file_path, params, trial_idx, metrics) do
+    log_entry = """
+    Config: #{inspect(params)}
+    Trial #{trial_idx}: accuracy=#{metrics["accuracy"]}, recall=#{metrics["recall"]}
+    --------------------------------------------------
+    """
+    File.write!(file_path, log_entry, [:append])
+  end
+
+  defp log_configuration_result(file_path, config_result) do
+    %{
+      params: params,
+      avg_accuracy: avg_accuracy,
+      avg_recall: avg_recall,
+      f1_score: f1_score,
+      all_trials: trials
+    } = config_result
+
+    trials_entries = 
+      trials
+      |> Enum.with_index(1)
+      |> Enum.map_join("\n", fn {metrics, idx} ->
+        "Trial #{idx}: accuracy=#{metrics["accuracy"]}, recall=#{metrics["recall"]}"
+      end)
+
+    log_entry = """
+    \nConfiguration: #{inspect(params)}
+    All trials:
+    #{trials_entries}
+    Average: accuracy=#{avg_accuracy}, recall=#{avg_recall}, F1-score=#{f1_score}
+    ==================================================
+    \n
+    """
+    File.write!(file_path, log_entry, [:append])
+  end
+end
+```
+
+```elixir
+# Thermosol.GridSearch.run(
+#   train_pipeline,
+#   val_pipeline,
+#   test_pipeline,
+#   pos_weights,
+#   neg_weights,
+#   200,
+#   1
+# )
+
+```
+
+```elixir
+
+```

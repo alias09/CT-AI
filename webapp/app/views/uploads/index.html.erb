@@ -1,0 +1,27 @@
+<h1>Анализ КТ-снимков</h1>
+
+<p>Загрузите ZIP-архив с DICOM-файлами пациента для получения отчета.</p>
+
+<hr>
+
+<%# Выводим флеш-сообщения (уведомления) %>
+<% if flash[:notice] %>
+  <div class="alert alert-success" role="alert">
+    <%= flash[:notice] %>
+  </div>
+<% end %>
+<% if flash[:alert] %>
+  <div class="alert alert-danger" role="alert">
+    <%= flash[:alert] %>
+  </div>
+<% end %>
+
+
+<%= form_with(url: upload_file_path, method: :post, multipart: true) do |form| %>
+  <div class="mb-3">
+    <%= form.label :dicom_zips, "Выберите .zip архивы для загрузки", class: "form-label" %>
+    <%= form.file_field :dicom_zips, multiple: true, class: "form-control", accept: ".zip" %>
+  </div>
+
+  <%= form.submit "Загрузить и обработать", class: "btn btn-primary" %>
+<% end %>

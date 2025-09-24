@@ -1,0 +1,48 @@
+wb = xlsx_package.workbook
+
+wb.add_worksheet(name: "DICOM Analysis Report") do |sheet|
+  # Стили
+  header_style = sheet.styles.add_style(b: true, bg_color: "EFEFEF", alignment: { horizontal: :center })
+  default_style = sheet.styles.add_style(alignment: { horizontal: :left })
+
+  # Заголовки в соответствии с ТЗ
+  headers = [
+    'path_to_study',
+    'study_uid',
+    'series_uid',
+    'probability_of_pathology',
+    'pathology',
+    'processing_status',
+    'time_of_processing'
+  ]
+  sheet.add_row headers, style: header_style
+
+  # Данные
+  @uploads.each do |upload|
+    # Форматирование данных в соответствии с ТЗ
+    status = case upload.status
+             when 'completed'
+               'Success'
+             when 'failed'
+               'Failure'
+             else
+               upload.status # pending, processing
+             end
+
+    path_to_study = upload.result_path.present? ? upload.result_path : ''
+
+    row_data = [
+      path_to_study,
+      upload.study_uid,
+      upload.series_uid,
+      upload.probability_of_pathology,
+      upload.pathology, # Уже хранится как 0 или 1
+      status,
+      upload.time_of_processing
+    ]
+    sheet.add_row row_data, style: default_style
+  end
+
+  # Автоматическая ширина колонок
+  sheet.column_widths(*([nil] * headers.length))
+end
