@@ -52,5 +52,9 @@ RUN /webapp/lib/python/venv/bin/pip install --no-cache-dir -r /webapp/lib/python
 # Копируем остальное приложение
 COPY . .
 
-# Запускаем сервер
+# Делает entrypoint исполняемым и подключает его
+RUN chmod +x ./entrypoint.sh
+ENTRYPOINT ["./entrypoint.sh"]
+
+# По умолчанию запускаем сервер Rails (может быть переопределено docker-compose)
 CMD ["bundle", "exec", "rails", "server", "-b", "0.0.0.0"]
