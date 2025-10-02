@@ -97,15 +97,6 @@ webapp/
   lib/python/ (ML‑скрипты)
   vendor/assets/ml_models/model.onnx
   docker-compose.yml
-DATASETS.md
-PLAN.md
-PROJECT_STATUS.md
 ```
 
-Примечание: для развёртывания достаточно каталога `webapp/` — в нём есть всё необходимое (Dockerfile, docker-compose.yml, приложение и скрипты). Внешние файлы (README, PLAN, PROJECT_STATUS, DATASETS) носят справочный характер.
-
-## Лицензия
-Уточните лицензию проекта при публикации.
-
-## Благодарности
-Датасеты и источники перечислены в `DATASETS.md`.
+Примечание: для развёртывания достаточно каталога `webapp/` — в нём есть всё необходимое (Dockerfile, docker-compose.yml, приложение и скрипты).
